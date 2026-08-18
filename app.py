@@ -318,6 +318,60 @@ def fetch_weather_saved(city="Seoul", limit=365):
         return cur.fetchall()
 
 
+def fetch_weather_collected_today(city="Seoul"):
+    """오늘(한국시간) 수집한 날씨만 반환."""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT weather_date, temp_max, temp_min, precipitation "
+            "FROM weather WHERE city = %s "
+            "AND (collected_at AT TIME ZONE 'Asia/Seoul')::date "
+            "    = (now() AT TIME ZONE 'Asia/Seoul')::date "
+            "ORDER BY weather_date",
+            (city,),
+        )
+        return cur.fetchall()
+
+
+# ──────────────────────────────────────────────────────────────
+# 2-3) 노션 연동 (Open-Meteo 로 모은 날씨를 노션 DB 에 한 줄씩 추가)
+# ──────────────────────────────────────────────────────────────
+NOTION_API = "https://api.notion.com/v1"
+NOTION_VERSION = "2022-06-28"
+
+
+def add_weather_rows_to_notion(rows):
+    """rows: [(date, tmax, tmin, precip), ...] 를 노션 DB 에 한 줄씩 추가.
+    '테스트'(title)=날씨 내용, '담당자'(people)=secrets 의 notion_person_id.
+    반환: 추가한 줄 수."""
+    token = get_secret("notion_token")
+    db_id = get_secret("notion_db_id")
+    person_id = get_secret("notion_person_id")
+    if not token or not db_id:
+        raise RuntimeError("secrets 에 notion_token / notion_db_id 가 필요합니다.")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    added = 0
+    for d, tmax, tmin, prcp in rows:
+        content = f"{d} 서울 · 최고 {tmax}°C / 최저 {tmin}°C / 강수 {prcp}mm"
+        props = {"테스트": {"title": [{"text": {"content": content}}]}}
+        if person_id:
+            props["담당자"] = {"people": [{"id": person_id}]}
+        payload = {"parent": {"database_id": db_id}, "properties": props}
+        req = urllib.request.Request(
+            NOTION_API + "/pages",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            resp.read()
+        added += 1
+    return added
+
+
 # ──────────────────────────────────────────────────────────────
 # 3) 검색 (theergo.co.kr)
 # ──────────────────────────────────────────────────────────────
@@ -572,6 +626,28 @@ def render_weather():
             st.dataframe(table, use_container_width=True)
     except Exception as e:
         st.error(f"날씨 조회 실패: {e}")
+
+    # 노션으로 보내기 — 오늘 모은 날씨를 노션 DB에 한 줄씩 추가
+    if get_secret("notion_token"):
+        st.divider()
+        st.caption("노션으로 보내기 ('테스트' 칸=날씨 내용, '담당자' 칸=지정한 사용자)")
+        if st.button("📤 오늘 모은 서울 날씨를 노션에 한 줄씩 추가"):
+            try:
+                today_rows = fetch_weather_collected_today()
+            except Exception as e:
+                st.error(f"조회 실패: {e}")
+                today_rows = []
+            if not today_rows:
+                st.info("오늘 수집한 날씨가 없습니다. 위에서 먼저 수집하세요.")
+            else:
+                rows = [
+                    (r[0].strftime("%Y-%m-%d"), r[1], r[2], r[3]) for r in today_rows
+                ]
+                try:
+                    n = add_weather_rows_to_notion(rows)
+                    st.success(f"노션에 {n}줄 추가했습니다.")
+                except Exception as e:
+                    st.error(f"노션 추가 실패: {e}")
 
 
 def main():
