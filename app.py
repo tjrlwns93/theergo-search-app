@@ -29,6 +29,10 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Search-Bot"}
 # 연습용 주문 API (인증 불필요, date/page 파라미터, 100건씩 페이지네이션)
 ORDERS_API = "https://sp.ermore.co.kr/api/edu-leader/practice/orders"
 
+# 날씨 API (Open-Meteo, 무료·키 불필요) — 서울 기준
+WEATHER_API = "https://api.open-meteo.com/v1/forecast"
+SEOUL_LAT, SEOUL_LON = 37.5665, 126.9780
+
 st.set_page_config(page_title="더에르고 검색기", page_icon="🔎")
 
 
@@ -123,6 +127,20 @@ def init_db():
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_orders_date ON orders (order_date);"
+        )
+        # 날씨 테이블: (도시, 날짜) 를 PK 로 두어 같은 날짜 재수집 시 중복 방지
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weather (
+                city         TEXT NOT NULL DEFAULT 'Seoul',
+                weather_date DATE NOT NULL,
+                temp_max     REAL,
+                temp_min     REAL,
+                precipitation REAL,
+                collected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (city, weather_date)
+            );
+            """
         )
         conn.commit()
 
@@ -221,6 +239,81 @@ def fetch_orders_by_date(date_obj, limit=2000):
             "SELECT order_no, ordered_at, product, product_option, qty, amount, status "
             "FROM orders WHERE order_date = %s ORDER BY order_no LIMIT %s",
             (date_obj, limit),
+        )
+        return cur.fetchall()
+
+
+# ──────────────────────────────────────────────────────────────
+# 2-2) 날씨 수집 (Open-Meteo → DB), 서울 기준
+# ──────────────────────────────────────────────────────────────
+def fetch_weather(start_date, end_date):
+    """서울의 날짜별 최고/최저기온·강수량을 가져와 리스트로 반환.
+    반환: [(date, tmax, tmin, precip), ...]"""
+    url = WEATHER_API + "?" + urllib.parse.urlencode({
+        "latitude": SEOUL_LAT,
+        "longitude": SEOUL_LON,
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
+        "timezone": "Asia/Seoul",
+        "start_date": start_date,
+        "end_date": end_date,
+    })
+    req = urllib.request.Request(
+        url, headers={"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+    daily = data.get("daily") or {}
+    times = daily.get("time") or []
+    tmax = daily.get("temperature_2m_max") or []
+    tmin = daily.get("temperature_2m_min") or []
+    prcp = daily.get("precipitation_sum") or []
+    rows = []
+    for i, d in enumerate(times):
+        rows.append((
+            d,
+            tmax[i] if i < len(tmax) else None,
+            tmin[i] if i < len(tmin) else None,
+            prcp[i] if i < len(prcp) else None,
+        ))
+    return rows
+
+
+def upsert_weather(rows, city="Seoul"):
+    """(도시,날짜) 기준 UPSERT. 같은 날짜를 다시 가져와도 중복 없이 갱신.
+    반환: (신규 건수, 갱신 건수)."""
+    if not rows:
+        return 0, 0
+    new_cnt = upd_cnt = 0
+    with get_conn() as conn, conn.cursor() as cur:
+        for d, tmax, tmin, prcp in rows:
+            cur.execute(
+                """
+                INSERT INTO weather
+                    (city, weather_date, temp_max, temp_min, precipitation, collected_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                ON CONFLICT (city, weather_date) DO UPDATE SET
+                    temp_max      = EXCLUDED.temp_max,
+                    temp_min      = EXCLUDED.temp_min,
+                    precipitation = EXCLUDED.precipitation,
+                    collected_at  = now()
+                RETURNING (xmax = 0) AS inserted
+                """,
+                (city, d, tmax, tmin, prcp),
+            )
+            if cur.fetchone()[0]:
+                new_cnt += 1
+            else:
+                upd_cnt += 1
+        conn.commit()
+    return new_cnt, upd_cnt
+
+
+def fetch_weather_saved(city="Seoul", limit=365):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT weather_date, temp_max, temp_min, precipitation "
+            "FROM weather WHERE city = %s ORDER BY weather_date DESC LIMIT %s",
+            (city, limit),
         )
         return cur.fetchall()
 
@@ -431,21 +524,75 @@ def render_orders():
         st.error(f"주문 조회 실패: {e}")
 
 
+def render_weather():
+    st.write("서울의 날짜별 최고·최저 기온과 강수량을 Open-Meteo에서 가져와 DB에 저장합니다.")
+
+    today = datetime.date.today()
+    c1, c2 = st.columns(2)
+    with c1:
+        start = st.date_input("시작 날짜", value=today - datetime.timedelta(days=6))
+    with c2:
+        end = st.date_input("끝 날짜", value=today)
+
+    if start > end:
+        st.warning("시작 날짜가 끝 날짜보다 늦습니다.")
+    elif st.button("🌤️ 날씨 가져와 저장", type="primary"):
+        try:
+            rows = fetch_weather(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        except Exception as e:
+            st.error(f"API 호출 실패: {e}")
+            st.stop()
+        if not rows:
+            st.info("해당 기간의 날씨 데이터가 없습니다.")
+        else:
+            try:
+                new_cnt, upd_cnt = upsert_weather(rows)
+                st.success(
+                    f"완료! {len(rows)}일치 수집 "
+                    f"→ 신규 {new_cnt}건 · 갱신 {upd_cnt}건 (중복은 자동 제외)"
+                )
+            except Exception as e:
+                st.error(f"저장 실패: {e}")
+
+    st.divider()
+    st.caption("DB에 저장된 서울 날씨 (최근순)")
+    try:
+        saved = fetch_weather_saved()
+        st.write(f"저장된 날짜: **{len(saved)}일**")
+        if saved:
+            table = [
+                {
+                    "날짜": s[0].strftime("%Y-%m-%d"),
+                    "최고기온(°C)": s[1],
+                    "최저기온(°C)": s[2],
+                    "강수량(mm)": s[3],
+                }
+                for s in saved
+            ]
+            st.dataframe(table, use_container_width=True)
+    except Exception as e:
+        st.error(f"날씨 조회 실패: {e}")
+
+
 def main():
     st.title("🔎 더에르고 검색기")
 
-    # DB 준비 (검색결과·주문 테이블 생성)
+    # DB 준비 (검색결과·주문·날씨 테이블 생성)
     try:
         init_db()
     except Exception as e:
         st.error(f"DB 연결 실패: {e}")
         st.stop()
 
-    tab_search, tab_orders = st.tabs(["🔎 검색어 수집", "📦 주문 수집"])
+    tab_search, tab_orders, tab_weather = st.tabs(
+        ["🔎 검색어 수집", "📦 주문 수집", "🌤️ 날씨"]
+    )
     with tab_search:
         render_search()
     with tab_orders:
         render_orders()
+    with tab_weather:
+        render_weather()
 
 
 if not check_password():
