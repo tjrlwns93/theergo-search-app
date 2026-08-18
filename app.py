@@ -6,8 +6,10 @@
 - 결과를 Supabase(PostgreSQL)에 저장하고, 저장 이력을 보여준다.
 - 접속정보/비밀번호는 코드가 아니라 secrets(.streamlit/secrets.toml)에서 읽는다.
 """
+import datetime
 import html as html_mod
 import io
+import json
 import re
 import time
 import urllib.parse
@@ -23,6 +25,9 @@ import streamlit as st
 BASE = "https://theergo.co.kr"
 SEARCH_URL = BASE + "/product/search.html?keyword="
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Search-Bot"}
+
+# 연습용 주문 API (인증 불필요, date/page 파라미터, 100건씩 페이지네이션)
+ORDERS_API = "https://sp.ermore.co.kr/api/edu-leader/practice/orders"
 
 st.set_page_config(page_title="더에르고 검색기", page_icon="🔎")
 
@@ -100,6 +105,25 @@ def init_db():
             );
             """
         )
+        # 주문 테이블: order_no 를 PK 로 두어 같은 날짜 재수집 시 중복 방지
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                order_no       TEXT PRIMARY KEY,
+                order_date     DATE NOT NULL,
+                ordered_at     TEXT,
+                product        TEXT,
+                product_option TEXT,
+                qty            INTEGER,
+                amount         BIGINT,
+                status         TEXT,
+                collected_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_date ON orders (order_date);"
+        )
         conn.commit()
 
 
@@ -119,6 +143,84 @@ def fetch_history(limit=200):
             "SELECT keyword, title, link, searched_at "
             "FROM search_results ORDER BY id DESC LIMIT %s",
             (limit,),
+        )
+        return cur.fetchall()
+
+
+# ──────────────────────────────────────────────────────────────
+# 2-1) 주문 수집 (연습용 API → DB)
+# ──────────────────────────────────────────────────────────────
+def fetch_orders(date_str, progress=None, max_pages=1000):
+    """해당 날짜의 모든 주문을 page 를 넘기며(100건씩) 모아서 반환.
+    반환: (rows_list, total). 종료조건: 빈 페이지 또는 total 도달."""
+    all_rows = []
+    total = None
+    page = 1
+    while page <= max_pages:
+        url = ORDERS_API + "?" + urllib.parse.urlencode({"date": date_str, "page": page})
+        req = urllib.request.Request(
+            url, headers={"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        rows = data.get("rows") or []
+        if not rows:
+            break
+        all_rows.extend(rows)
+        total = data.get("total")
+        if progress:
+            progress(len(all_rows), total, page)
+        if total is not None and len(all_rows) >= total:
+            break
+        page += 1
+    return all_rows, total
+
+
+def upsert_orders(date_obj, rows):
+    """order_no 기준 UPSERT. 같은 주문을 다시 넣어도 중복으로 쌓이지 않고 갱신됨.
+    반환: (신규 건수, 갱신 건수)."""
+    if not rows:
+        return 0, 0
+    new_cnt = upd_cnt = 0
+    with get_conn() as conn, conn.cursor() as cur:
+        for r in rows:
+            cur.execute(
+                """
+                INSERT INTO orders
+                    (order_no, order_date, ordered_at, product, product_option,
+                     qty, amount, status, collected_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (order_no) DO UPDATE SET
+                    order_date     = EXCLUDED.order_date,
+                    ordered_at     = EXCLUDED.ordered_at,
+                    product        = EXCLUDED.product,
+                    product_option = EXCLUDED.product_option,
+                    qty            = EXCLUDED.qty,
+                    amount         = EXCLUDED.amount,
+                    status         = EXCLUDED.status,
+                    collected_at   = now()
+                RETURNING (xmax = 0) AS inserted
+                """,
+                (
+                    r.get("order_no"), date_obj, r.get("ordered_at"),
+                    r.get("product"), r.get("option"), r.get("qty"),
+                    r.get("amount"), r.get("status"),
+                ),
+            )
+            if cur.fetchone()[0]:
+                new_cnt += 1
+            else:
+                upd_cnt += 1
+        conn.commit()
+    return new_cnt, upd_cnt
+
+
+def fetch_orders_by_date(date_obj, limit=2000):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT order_no, ordered_at, product, product_option, qty, amount, status "
+            "FROM orders WHERE order_date = %s ORDER BY order_no LIMIT %s",
+            (date_obj, limit),
         )
         return cur.fetchall()
 
@@ -184,16 +286,8 @@ def to_excel_bytes(rows, header):
 # ──────────────────────────────────────────────────────────────
 # 4) 메인 화면
 # ──────────────────────────────────────────────────────────────
-def main():
-    st.title("🔎 더에르고 검색기")
+def render_search():
     st.write("검색어를 넣으면 theergo.co.kr 첫 번째 결과의 제목·링크를 가져와 저장합니다.")
-
-    # DB 준비
-    try:
-        init_db()
-    except Exception as e:
-        st.error(f"DB 연결 실패: {e}")
-        st.stop()
 
     st.subheader("1. 검색어 입력")
     tab1, tab2 = st.tabs(["직접 입력", "엑셀 업로드"])
@@ -276,6 +370,82 @@ def main():
             st.info("아직 저장된 이력이 없습니다.")
     except Exception as e:
         st.error(f"이력 조회 실패: {e}")
+
+
+def render_orders():
+    st.write("날짜를 고르고 버튼을 누르면 그 날 주문을 API에서 100건씩 모두 가져와 DB에 쌓습니다.")
+
+    picked = st.date_input("수집할 날짜", value=datetime.date(2026, 8, 18))
+    date_str = picked.strftime("%Y-%m-%d")
+
+    if st.button("📦 이 날짜 주문 수집", type="primary"):
+        prog = st.progress(0.0)
+        area = st.empty()
+
+        def on_prog(got, total, page):
+            if total:
+                prog.progress(min(got / total, 1.0))
+            area.write(f"{page}페이지까지 {got}/{total or '?'}건 가져오는 중…")
+
+        try:
+            rows, total = fetch_orders(date_str, progress=on_prog)
+        except Exception as e:
+            st.error(f"API 호출 실패: {e}")
+            st.stop()
+
+        prog.progress(1.0)
+        if not rows:
+            st.info(f"{date_str} 에는 주문이 없습니다.")
+        else:
+            try:
+                new_cnt, upd_cnt = upsert_orders(picked, rows)
+                st.success(
+                    f"완료! {date_str} 주문 {len(rows)}건 수집 "
+                    f"→ 신규 {new_cnt}건 · 갱신 {upd_cnt}건 (중복은 자동 제외)"
+                )
+            except Exception as e:
+                st.error(f"저장 실패: {e}")
+
+    st.divider()
+    st.caption(f"DB에 저장된 {date_str} 주문")
+    try:
+        saved = fetch_orders_by_date(picked)
+        st.write(f"저장된 주문: **{len(saved)}건**")
+        if saved:
+            st.dataframe(
+                [
+                    {
+                        "주문번호": s[0],
+                        "주문시각": s[1],
+                        "상품": s[2],
+                        "옵션": s[3],
+                        "수량": s[4],
+                        "금액": s[5],
+                        "상태": s[6],
+                    }
+                    for s in saved
+                ],
+                use_container_width=True,
+            )
+    except Exception as e:
+        st.error(f"주문 조회 실패: {e}")
+
+
+def main():
+    st.title("🔎 더에르고 검색기")
+
+    # DB 준비 (검색결과·주문 테이블 생성)
+    try:
+        init_db()
+    except Exception as e:
+        st.error(f"DB 연결 실패: {e}")
+        st.stop()
+
+    tab_search, tab_orders = st.tabs(["🔎 검색어 수집", "📦 주문 수집"])
+    with tab_search:
+        render_search()
+    with tab_orders:
+        render_orders()
 
 
 if not check_password():
