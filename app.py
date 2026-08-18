@@ -58,13 +58,33 @@ def check_password() -> bool:
 # 2) 데이터베이스 (Supabase PostgreSQL)
 # ──────────────────────────────────────────────────────────────
 def get_conn():
+    # 방법 1 (권장): 항목별 접속정보 — 비번 특수문자/URL 인코딩 걱정 없음
+    host = get_secret("db_host")
+    if host:
+        return psycopg2.connect(
+            host=host,
+            port=int(get_secret("db_port", 5432)),
+            user=get_secret("db_user"),
+            password=get_secret("db_password"),
+            dbname=get_secret("db_name", "postgres"),
+            sslmode="require",
+            connect_timeout=15,
+        )
+
+    # 방법 2: 전체 연결 URL (특수문자는 직접 URL 인코딩 필요)
     url = get_secret("db_url")
     if not url:
-        raise RuntimeError("secrets 에 db_url 이 없습니다.")
-    # Supabase 는 SSL 필요
+        raise RuntimeError(
+            "secrets 에 db_host(항목별) 또는 db_url 이 필요합니다."
+        )
+    if "<region>" in url or "[YOUR-PASSWORD]" in url or "[" in url:
+        raise RuntimeError(
+            "db_url 에 <region> / [YOUR-PASSWORD] 같은 자리표시자가 그대로 있습니다. "
+            "실제 값으로 바꿔주세요."
+        )
     if "sslmode=" not in url:
         url += ("&" if "?" in url else "?") + "sslmode=require"
-    return psycopg2.connect(url)
+    return psycopg2.connect(url, connect_timeout=15)
 
 
 def init_db():

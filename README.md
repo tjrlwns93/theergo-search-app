@@ -12,11 +12,17 @@ cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # 값 채우기
 streamlit run app.py
 ```
 
-`.streamlit/secrets.toml` 에 두 값을 넣습니다.
+`.streamlit/secrets.toml` 에 값을 넣습니다. (자세한 예시는 `secrets.toml.example`)
 
 ```toml
 app_password = "로그인 비밀번호"
-db_url = "postgresql://postgres:[비밀번호]@db.xxxx.supabase.co:5432/postgres"
+
+# Supabase 대시보드 > Connect > "Session pooler" 값을 그대로 복사
+db_host = "aws-0-ap-northeast-2.pooler.supabase.com"
+db_port = 5432
+db_user = "postgres.<프로젝트ref>"
+db_password = "실제 DB 비밀번호"
+db_name = "postgres"
 ```
 
 > `.streamlit/secrets.toml` 는 `.gitignore` 에 등록되어 **깃허브에 올라가지 않습니다.**
@@ -24,13 +30,13 @@ db_url = "postgresql://postgres:[비밀번호]@db.xxxx.supabase.co:5432/postgres
 ## 배포 (Streamlit Community Cloud)
 
 1. 이 저장소를 연결하고 `app.py` 를 지정합니다.
-2. **App settings → Secrets** 에 `app_password`, `db_url` 을 붙여넣습니다.
+2. **App settings → Secrets** 에 `app_password` 와 DB 접속정보(`db_host` 등)를 붙여넣습니다.
 3. `requirements.txt` 를 보고 클라우드가 자동으로 패키지를 설치합니다.
 
 > ⚠️ **연결 주소 주의:** Supabase 의 **direct** 주소(`db.xxxx.supabase.co`)는 IPv6 전용이라
 > 일반 PC / Streamlit Cloud(IPv4)에서는 `could not translate host name ...` 오류가 납니다.
-> 대시보드 **Connect → Session pooler** 의 IPv4 주소
-> (`postgresql://postgres.xxxx:[PW]@aws-0-<region>.pooler.supabase.com:5432/postgres`)를 `db_url` 로 쓰세요.
+> 반드시 대시보드 **Connect → Session pooler** 의 값을 쓰세요. `db_host` 에는 거기 보이는
+> host(예: `aws-0-ap-northeast-2.pooler.supabase.com`)를 **그대로** 붙여넣습니다.
 
 ## 파일
 
