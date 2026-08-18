@@ -1,0 +1,13 @@
+# 비밀정보 — 절대 깃허브에 올리지 않는다
+.streamlit/secrets.toml
+*.env
+.env
+
+# 파이썬
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 로컬 산출물
+검색결과.xlsx
