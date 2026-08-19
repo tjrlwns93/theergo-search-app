@@ -6,6 +6,7 @@
 - 결과를 Supabase(PostgreSQL)에 저장하고, 저장 이력을 보여준다.
 - 접속정보/비밀번호는 코드가 아니라 secrets(.streamlit/secrets.toml)에서 읽는다.
 """
+import base64
 import datetime
 import html as html_mod
 import io
@@ -139,6 +140,19 @@ def init_db():
                 precipitation REAL,
                 collected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 PRIMARY KEY (city, weather_date)
+            );
+            """
+        )
+        # 카페24 OAuth 토큰 저장 (몰당 1행). 고객정보는 저장하지 않음.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cafe24_token (
+                mall_id                  TEXT PRIMARY KEY,
+                access_token             TEXT,
+                refresh_token            TEXT,
+                expires_at               TEXT,
+                refresh_token_expires_at TEXT,
+                updated_at               TIMESTAMPTZ NOT NULL DEFAULT now()
             );
             """
         )
@@ -370,6 +384,175 @@ def add_weather_rows_to_notion(rows):
             resp.read()
         added += 1
     return added
+
+
+# ──────────────────────────────────────────────────────────────
+# 2-4) 카페24 관리자 API (OAuth + 토큰 자동갱신). 고객정보 미수집.
+# ──────────────────────────────────────────────────────────────
+CAFE24_API_VERSION = "2022-06-01"  # X-Cafe24-Api-Version (앱 설정과 맞추세요)
+
+
+def _cafe24_cfg():
+    return (
+        get_secret("cafe24_mall_id"),
+        get_secret("cafe24_client_id"),
+        get_secret("cafe24_client_secret"),
+        get_secret("cafe24_redirect_uri"),
+    )
+
+
+def cafe24_authorize_url(state="ergo2-state"):
+    """1단계: 승인 요청 주소. scope 는 주문 읽기만(고객정보 scope 없음)."""
+    mall_id, client_id, _, redirect_uri = _cafe24_cfg()
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "state": state,
+        "redirect_uri": redirect_uri,
+        "scope": "mall.read_order",
+    }
+    return (
+        f"https://{mall_id}.cafe24api.com/api/v2/oauth/authorize?"
+        + urllib.parse.urlencode(params)
+    )
+
+
+def _cafe24_save_token(mall_id, tok):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO cafe24_token
+                (mall_id, access_token, refresh_token, expires_at,
+                 refresh_token_expires_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, now())
+            ON CONFLICT (mall_id) DO UPDATE SET
+                access_token             = EXCLUDED.access_token,
+                refresh_token            = EXCLUDED.refresh_token,
+                expires_at               = EXCLUDED.expires_at,
+                refresh_token_expires_at = EXCLUDED.refresh_token_expires_at,
+                updated_at               = now()
+            """,
+            (
+                mall_id, tok.get("access_token"), tok.get("refresh_token"),
+                tok.get("expires_at"), tok.get("refresh_token_expires_at"),
+            ),
+        )
+        conn.commit()
+
+
+def _cafe24_load_token():
+    mall_id = get_secret("cafe24_mall_id")
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT access_token, refresh_token, expires_at "
+            "FROM cafe24_token WHERE mall_id = %s",
+            (mall_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {"access_token": row[0], "refresh_token": row[1], "expires_at": row[2]}
+
+
+def _cafe24_token_request(form):
+    """POST /oauth/token (Basic 인증). 응답 토큰을 DB에 저장하고 반환."""
+    mall_id, client_id, client_secret, _ = _cafe24_cfg()
+    url = f"https://{mall_id}.cafe24api.com/api/v2/oauth/token"
+    basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    req = urllib.request.Request(
+        url,
+        data=urllib.parse.urlencode(form).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Basic {basic}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        tok = json.loads(resp.read().decode("utf-8"))
+    _cafe24_save_token(mall_id, tok)
+    return tok
+
+
+def cafe24_exchange_code(code):
+    """3~4단계: 코드 → 액세스/갱신 토큰 교환."""
+    _, _, _, redirect_uri = _cafe24_cfg()
+    return _cafe24_token_request({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+    })
+
+
+def cafe24_refresh_token():
+    """갱신 토큰으로 새 액세스 토큰 발급(자동 갱신용)."""
+    tok = _cafe24_load_token()
+    if not tok or not tok.get("refresh_token"):
+        raise RuntimeError("갱신할 refresh_token 이 없습니다. 다시 연결(승인)하세요.")
+    return _cafe24_token_request({
+        "grant_type": "refresh_token",
+        "refresh_token": tok["refresh_token"],
+    })
+
+
+def cafe24_get(path, params=None):
+    """액세스 토큰으로 GET. 401(만료)이면 자동 갱신 후 1회 재시도."""
+    mall_id = get_secret("cafe24_mall_id")
+    tok = _cafe24_load_token()
+    if not tok:
+        raise RuntimeError("카페24가 아직 연결되지 않았습니다. 먼저 연결(승인)하세요.")
+
+    def _call(access_token):
+        url = f"https://{mall_id}.cafe24api.com{path}"
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "X-Cafe24-Api-Version": CAFE24_API_VERSION,
+        })
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    try:
+        return _call(tok["access_token"])
+    except urllib.error.HTTPError as e:
+        if e.code == 401:  # 액세스 토큰 만료 → 자동 갱신 후 재시도
+            newtok = cafe24_refresh_token()
+            return _call(newtok["access_token"])
+        raise
+
+
+def cafe24_today_summary():
+    """오늘 주문 건수와 매출(결제금액 합계). 금액·건수만 요청 — 고객정보 미수집."""
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    cnt = cafe24_get(
+        "/api/v2/admin/orders/count",
+        {"start_date": today, "end_date": today},
+    ).get("count", 0)
+
+    total = 0.0
+    offset, limit = 0, 100
+    while True:
+        data = cafe24_get("/api/v2/admin/orders", {
+            "start_date": today, "end_date": today,
+            "limit": limit, "offset": offset,
+            # 금액 필드만 요청 — 이름/연락처/주소는 애초에 받지 않음
+            "fields": "order_id,actual_order_amount,payment_amount",
+        })
+        orders = data.get("orders") or []
+        if not orders:
+            break
+        for o in orders:
+            amt = o.get("actual_order_amount") or o.get("payment_amount") or 0
+            try:
+                total += float(amt)
+            except (TypeError, ValueError):
+                pass
+        if len(orders) < limit:
+            break
+        offset += limit
+    return cnt, total
 
 
 # ──────────────────────────────────────────────────────────────
@@ -650,18 +833,69 @@ def render_weather():
                     st.error(f"노션 추가 실패: {e}")
 
 
+def render_cafe24():
+    st.write(
+        "카페24(몰: **ergo2**) 관리자 API로 **오늘 매출·주문 건수**만 봅니다. "
+        "고객 이름·연락처·주소는 가져오지 않습니다(scope: 주문 읽기, 금액·건수만 집계)."
+    )
+    mall_id, client_id, client_secret, redirect_uri = _cafe24_cfg()
+    if not (mall_id and client_id and client_secret and redirect_uri):
+        st.warning(
+            "secrets 에 cafe24_client_id / cafe24_client_secret / "
+            "cafe24_redirect_uri 를 넣어주세요. (몰 아이디는 ergo2로 설정됨)"
+        )
+        return
+
+    # OAuth 콜백: 승인 후 ?code= 로 돌아오면 토큰 교환
+    code = st.query_params.get("code")
+    if code:
+        try:
+            cafe24_exchange_code(code)
+            st.query_params.clear()
+            st.success("카페24 연결 완료! 토큰을 저장했습니다.")
+        except Exception as e:
+            st.error(f"토큰 교환 실패: {e}")
+
+    try:
+        tok = _cafe24_load_token()
+    except Exception as e:
+        st.error(f"토큰 조회 실패: {e}")
+        return
+
+    if not tok:
+        st.info("아직 연결 전입니다. 아래 버튼으로 승인하세요.")
+        st.link_button("🔗 카페24 연결(승인)", cafe24_authorize_url())
+        return
+
+    st.success("연결됨 · 요청 시 토큰이 만료됐으면 자동으로 갱신됩니다.")
+    if st.button("📊 오늘 매출·주문 건수 보기", type="primary"):
+        try:
+            cnt, total = cafe24_today_summary()
+            c1, c2 = st.columns(2)
+            c1.metric("오늘 주문 건수", f"{cnt:,} 건")
+            c2.metric("오늘 매출(결제금액 합계)", f"{int(total):,} 원")
+        except Exception as e:
+            st.error(f"조회 실패: {e}")
+    if st.button("🔄 토큰 수동 갱신"):
+        try:
+            cafe24_refresh_token()
+            st.success("토큰을 갱신했습니다.")
+        except Exception as e:
+            st.error(f"갱신 실패: {e}")
+
+
 def main():
     st.title("🔎 더에르고 검색기")
 
-    # DB 준비 (검색결과·주문·날씨 테이블 생성)
+    # DB 준비 (검색결과·주문·날씨·카페24토큰 테이블 생성)
     try:
         init_db()
     except Exception as e:
         st.error(f"DB 연결 실패: {e}")
         st.stop()
 
-    tab_search, tab_orders, tab_weather = st.tabs(
-        ["🔎 검색어 수집", "📦 주문 수집", "🌤️ 날씨"]
+    tab_search, tab_orders, tab_weather, tab_cafe24 = st.tabs(
+        ["🔎 검색어 수집", "📦 주문 수집", "🌤️ 날씨", "🛒 카페24"]
     )
     with tab_search:
         render_search()
@@ -669,6 +903,8 @@ def main():
         render_orders()
     with tab_weather:
         render_weather()
+    with tab_cafe24:
+        render_cafe24()
 
 
 if not check_password():
