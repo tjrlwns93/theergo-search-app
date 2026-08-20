@@ -8,10 +8,13 @@
 """
 import base64
 import datetime
+import hashlib
 import html as html_mod
 import io
 import json
+import os
 import re
+import secrets as secretsmod
 import time
 import urllib.parse
 import urllib.request
@@ -19,6 +22,10 @@ import urllib.request
 import openpyxl
 import psycopg2
 import streamlit as st
+from dotenv import load_dotenv
+from streamlit_oauth import OAuth2Component
+
+load_dotenv()  # 로컬 .env 로드 (Streamlit Cloud 에서는 Secrets 사용)
 
 # ──────────────────────────────────────────────────────────────
 # 설정 (secrets 에서 읽음 — 코드에 비밀정보를 두지 않는다)
@@ -45,23 +52,307 @@ def get_secret(key: str, default=None):
 
 
 # ──────────────────────────────────────────────────────────────
-# 1) 비밀번호 로그인 게이트
+# 1) 인증 · 권한 (구글 로그인 + 아이디/비번 로그인 + 화면 권한)
 # ──────────────────────────────────────────────────────────────
-def check_password() -> bool:
-    if st.session_state.get("auth_ok"):
-        return True
+def cfg(key, default=None):
+    """설정값: .env(os.environ) 우선, 없으면 st.secrets."""
+    v = os.getenv(key)
+    if v not in (None, ""):
+        return v
+    for k in (key, key.lower(), key.upper()):
+        try:
+            val = st.secrets[k]
+            if val not in (None, ""):
+                return val
+        except Exception:
+            pass
+    return default
 
-    st.title("🔒 로그인")
-    st.caption("비밀번호를 입력해야 화면이 보입니다.")
-    pw = st.text_input("비밀번호", type="password")
-    if st.button("로그인"):
-        real = get_secret("app_password")
-        if real and pw == real:
-            st.session_state["auth_ok"] = True
+
+def admin_emails():
+    raw = cfg("ADMIN_EMAILS",
+              "tjrlwns93@ermore.co.kr,rho_js@ermore.co.kr,shheo@ermore.co.kr")
+    return [e.strip().lower() for e in str(raw).split(",") if e.strip()]
+
+
+def allowed_domain():
+    return str(cfg("ALLOWED_DOMAIN", "ermore.co.kr")).lower().lstrip("@")
+
+
+# 비밀번호 해시 (표준 라이브러리 pbkdf2)
+def hash_pw(pw):
+    salt = secretsmod.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 200_000)
+    return f"pbkdf2$200000${salt}${dk.hex()}"
+
+
+def verify_pw(pw, stored):
+    try:
+        _algo, iters, salt, h = stored.split("$")
+        dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), int(iters))
+        return secretsmod.compare_digest(dk.hex(), h)
+    except Exception:
+        return False
+
+
+def _rows_as_dicts(cur):
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+_USER_COLS = ("id, email, username, name, password_hash, auth_type, "
+              "is_admin, is_active, must_change_pw, screens")
+
+
+def db_get_user_by_username(username):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT {_USER_COLS} FROM app_users WHERE username=%s", (username,))
+        rows = _rows_as_dicts(cur)
+    return rows[0] if rows else None
+
+
+def db_upsert_google_user(email, name):
+    is_admin = email.lower() in admin_emails()
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO app_users (email, name, auth_type, is_admin)
+            VALUES (%s, %s, 'google', %s)
+            ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, is_admin = %s
+            RETURNING id, email, username, name, auth_type, is_admin,
+                      is_active, must_change_pw, screens
+            """,
+            (email.lower(), name, is_admin, is_admin),
+        )
+        conn.commit()
+        rows = _rows_as_dicts(cur)
+    return rows[0] if rows else None
+
+
+def _gen_username(name):
+    base = re.sub(r"[^a-z0-9]", "", (name or "").lower()) or "user"
+    for i in range(0, 1000):
+        cand = base if i == 0 else f"{base}{i + 1}"
+        if not db_get_user_by_username(cand):
+            return cand
+    return base + secretsmod.token_hex(3)
+
+
+def db_create_local_user(name, username=None):
+    uname = (username or "").strip() or _gen_username(name)
+    temp = secretsmod.token_urlsafe(6)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO app_users (username, name, password_hash, auth_type, must_change_pw) "
+            "VALUES (%s, %s, %s, 'local', TRUE)",
+            (uname, name, hash_pw(temp)),
+        )
+        conn.commit()
+    return uname, temp
+
+
+def db_reset_password(user_id):
+    temp = secretsmod.token_urlsafe(6)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE app_users SET password_hash=%s, must_change_pw=TRUE WHERE id=%s",
+            (hash_pw(temp), user_id),
+        )
+        conn.commit()
+    return temp
+
+
+def db_change_password(user_id, new_pw):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE app_users SET password_hash=%s, must_change_pw=FALSE WHERE id=%s",
+            (hash_pw(new_pw), user_id),
+        )
+        conn.commit()
+
+
+def db_list_users():
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT {_USER_COLS} FROM app_users ORDER BY id")
+        return _rows_as_dicts(cur)
+
+
+def db_update_user_screens(user_id, screens):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE app_users SET screens=%s WHERE id=%s", (list(screens), user_id))
+        conn.commit()
+
+
+def db_set_active(user_id, active):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE app_users SET is_active=%s WHERE id=%s", (bool(active), user_id))
+        conn.commit()
+
+
+def db_list_allowed_emails():
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT email FROM allowed_emails ORDER BY email")
+        return [r[0] for r in cur.fetchall()]
+
+
+def db_add_allowed_email(email):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO allowed_emails (email) VALUES (%s) ON CONFLICT DO NOTHING",
+            (email.lower(),),
+        )
+        conn.commit()
+
+
+def db_remove_allowed_email(email):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM allowed_emails WHERE lower(email)=lower(%s)", (email,))
+        conn.commit()
+
+
+def db_is_email_allowed(email):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM allowed_emails WHERE lower(email)=lower(%s)", (email,))
+        return cur.fetchone() is not None
+
+
+# ── 구글 로그인 (팝업) ─────────────────────────────────────────
+def _google_identity(token):
+    """토큰에서 이메일·이름 추출."""
+    idt = token.get("id_token")
+    if idt:
+        try:
+            payload = idt.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            data = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+            return (data.get("email") or "").lower(), data.get("name") or ""
+        except Exception:
+            pass
+    at = token.get("access_token")
+    if at:
+        req = urllib.request.Request(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {at}"},
+        )
+        data = json.loads(urllib.request.urlopen(req, timeout=15).read().decode("utf-8"))
+        return (data.get("email") or "").lower(), data.get("name") or ""
+    return "", ""
+
+
+def _handle_google_login(email, name):
+    email = (email or "").lower()
+    if not email:
+        st.error("구글 계정 이메일을 확인할 수 없습니다.")
+        return
+    is_admin = email in admin_emails()
+    allowed = (
+        is_admin
+        or email.endswith("@" + allowed_domain())
+        or db_is_email_allowed(email)
+    )
+    if not allowed:
+        st.session_state["denied_email"] = email
+        st.rerun()
+        return
+    row = db_upsert_google_user(email, name)
+    screens = SCREEN_KEYS if is_admin else (row.get("screens") or [])
+    st.session_state["user"] = {
+        "kind": "google", "id": row.get("id"), "email": email,
+        "name": name or email, "is_admin": is_admin, "screens": screens,
+    }
+    st.rerun()
+
+
+def _handle_local_login(username, password):
+    row = db_get_user_by_username((username or "").strip())
+    if (not row or row["auth_type"] != "local" or not row["is_active"]
+            or not verify_pw(password or "", row["password_hash"] or "")):
+        st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
+        return
+    st.session_state["user"] = {
+        "kind": "local", "id": row["id"], "username": row["username"],
+        "name": row["name"], "is_admin": False,
+        "screens": row["screens"] or [], "must_change_pw": row["must_change_pw"],
+    }
+    st.rerun()
+
+
+def render_login():
+    if st.session_state.get("denied_email"):
+        st.title("🚫 접근 권한이 없습니다")
+        st.write(f"**{st.session_state['denied_email']}** 계정은 접근이 허용되지 않았습니다.")
+        st.caption(f"@{allowed_domain()} 계정이거나, 관리자가 예외로 허용한 이메일이어야 합니다.")
+        if st.button("다른 계정으로 로그인"):
+            st.session_state.pop("denied_email", None)
             st.rerun()
-        else:
-            st.error("비밀번호가 틀렸습니다.")
-    return False
+        return
+
+    st.title("🔐 로그인")
+
+    gid, gsec = cfg("GOOGLE_CLIENT_ID"), cfg("GOOGLE_CLIENT_SECRET")
+    redirect = cfg("APP_URL") or cfg("cafe24_redirect_uri")
+    if gid and gsec and redirect:
+        oauth2 = OAuth2Component(
+            gid, gsec,
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "https://oauth2.googleapis.com/token",
+            "https://oauth2.googleapis.com/token",
+            "https://oauth2.googleapis.com/revoke",
+        )
+        result = oauth2.authorize_button(
+            name="구글 계정으로 로그인",
+            redirect_uri=redirect,
+            scope="openid email profile",
+            key="google_login",
+            use_container_width=True,
+            extras_params={"prompt": "select_account"},
+        )
+        if result and "token" in result:
+            email, name = _google_identity(result["token"])
+            _handle_google_login(email, name)
+    else:
+        st.info("구글 로그인 설정(GOOGLE_CLIENT_ID / SECRET / APP_URL)이 아직 없습니다.")
+
+    st.divider()
+    st.caption("구글이 없는 계정은 아이디·비밀번호로 로그인")
+    with st.form("local_login"):
+        u = st.text_input("아이디")
+        p = st.text_input("비밀번호", type="password")
+        if st.form_submit_button("로그인"):
+            _handle_local_login(u, p)
+
+    # (임시) 예비 로그인 — 새 로그인 확인 전까지 잠김 방지용. 확인되면 제거 예정.
+    bg = cfg("app_password")
+    if bg:
+        with st.expander("예비 로그인(임시)"):
+            bp = st.text_input("예비 비밀번호", type="password", key="bg_pw")
+            if st.button("예비 로그인"):
+                if bp == bg:
+                    st.session_state["user"] = {
+                        "kind": "break-glass", "name": "임시관리자",
+                        "email": None, "is_admin": True, "screens": SCREEN_KEYS,
+                    }
+                    st.rerun()
+                else:
+                    st.error("예비 비밀번호가 틀렸습니다.")
+
+
+def render_change_pw():
+    st.title("🔑 비밀번호 변경")
+    st.info("첫 로그인입니다. 새 비밀번호를 설정하세요.")
+    with st.form("change_pw"):
+        p1 = st.text_input("새 비밀번호(8자 이상)", type="password")
+        p2 = st.text_input("새 비밀번호 확인", type="password")
+        if st.form_submit_button("변경"):
+            if len(p1) < 8:
+                st.error("비밀번호는 8자 이상이어야 합니다.")
+            elif p1 != p2:
+                st.error("두 비밀번호가 다릅니다.")
+            else:
+                db_change_password(st.session_state["user"]["id"], p1)
+                st.session_state["user"]["must_change_pw"] = False
+                st.success("변경 완료!")
+                st.rerun()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -153,6 +444,33 @@ def init_db():
                 expires_at               TEXT,
                 refresh_token_expires_at TEXT,
                 updated_at               TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
+        # 사용자 계정 (구글/로컬) + 화면 권한
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_users (
+                id             BIGSERIAL PRIMARY KEY,
+                email          TEXT UNIQUE,
+                username       TEXT UNIQUE,
+                name           TEXT,
+                password_hash  TEXT,
+                auth_type      TEXT NOT NULL DEFAULT 'local',
+                is_admin       BOOLEAN NOT NULL DEFAULT FALSE,
+                is_active      BOOLEAN NOT NULL DEFAULT TRUE,
+                must_change_pw BOOLEAN NOT NULL DEFAULT FALSE,
+                screens        TEXT[] NOT NULL DEFAULT '{}',
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
+        # 도메인 예외로 허용할 이메일 목록
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS allowed_emails (
+                email    TEXT PRIMARY KEY,
+                added_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
             """
         )
@@ -884,30 +1202,131 @@ def render_cafe24():
             st.error(f"갱신 실패: {e}")
 
 
-def main():
-    st.title("🔎 더에르고 검색기")
+def render_admin():
+    st.title("🛠️ 관리자")
+    tab_u, tab_e = st.tabs(["사용자 관리", "접근 허용 이메일"])
 
-    # DB 준비 (검색결과·주문·날씨·카페24토큰 테이블 생성)
+    with tab_u:
+        st.subheader("새 로컬 계정 만들기")
+        with st.form("new_local_user"):
+            nm = st.text_input("이름")
+            uid = st.text_input("아이디(비우면 이름으로 자동생성)")
+            if st.form_submit_button("계정 생성") and nm.strip():
+                try:
+                    uname, temp = db_create_local_user(nm.strip(), uid)
+                    st.success(
+                        f"생성됨 → 아이디 `{uname}` · 임시비밀번호 `{temp}` "
+                        "(첫 로그인 시 변경 필요)"
+                    )
+                except Exception as e:
+                    st.error(f"생성 실패(아이디 중복?): {e}")
+
+        st.divider()
+        st.subheader("사용자 목록 · 화면 권한")
+        try:
+            users = db_list_users()
+        except Exception as e:
+            st.error(f"목록 조회 실패: {e}")
+            users = []
+        for u in users:
+            who = u["name"] or u["username"] or u["email"] or f"#{u['id']}"
+            tag = " · 관리자" if u["is_admin"] else ("" if u["is_active"] else " · 비활성")
+            with st.expander(f"{who} ({u['auth_type']}){tag}"):
+                if u["is_admin"]:
+                    st.caption("관리자는 모든 화면을 봅니다(고정).")
+                cur_screens = u["screens"] or []
+                chosen = []
+                cols = st.columns(len(SCREENS))
+                for i, (key, title, _fn) in enumerate(SCREENS):
+                    checked = cols[i].checkbox(
+                        title.split(" ", 1)[-1],
+                        value=(key in cur_screens),
+                        key=f"scr_{u['id']}_{key}",
+                        disabled=u["is_admin"],
+                    )
+                    if checked:
+                        chosen.append(key)
+                c1, c2, c3 = st.columns(3)
+                if c1.button("권한 저장", key=f"save_{u['id']}", disabled=u["is_admin"]):
+                    db_update_user_screens(u["id"], chosen)
+                    st.success("저장됨")
+                    st.rerun()
+                if c2.button(("비활성화" if u["is_active"] else "활성화"), key=f"act_{u['id']}"):
+                    db_set_active(u["id"], not u["is_active"])
+                    st.rerun()
+                if u["auth_type"] == "local" and c3.button("임시비번 재발급", key=f"rst_{u['id']}"):
+                    st.info(f"새 임시비밀번호: `{db_reset_password(u['id'])}`")
+
+    with tab_e:
+        st.subheader("접근 허용 이메일(도메인 예외)")
+        st.caption(f"@{allowed_domain()} 이 아니어도 여기 있으면 구글 로그인 허용.")
+        with st.form("add_allowed"):
+            e = st.text_input("이메일 추가")
+            if st.form_submit_button("추가") and e.strip():
+                db_add_allowed_email(e.strip())
+                st.success("추가됨")
+                st.rerun()
+        try:
+            for em in db_list_allowed_emails():
+                c1, c2 = st.columns([4, 1])
+                c1.write(em)
+                if c2.button("삭제", key=f"del_{em}"):
+                    db_remove_allowed_email(em)
+                    st.rerun()
+        except Exception as e:
+            st.error(f"조회 실패: {e}")
+
+
+# 화면 등록표: (키, 메뉴제목, 렌더함수) — 여기 없으면 어디에도 안 보임
+SCREENS = [
+    ("search", "🔎 검색어 수집", render_search),
+    ("orders", "📦 주문 수집", render_orders),
+    ("weather", "🌤️ 날씨", render_weather),
+    ("cafe24", "🛒 카페24", render_cafe24),
+]
+SCREEN_KEYS = [s[0] for s in SCREENS]
+
+
+def main():
+    # DB 준비 (검색결과·주문·날씨·카페24·사용자·허용이메일 테이블)
     try:
         init_db()
     except Exception as e:
         st.error(f"DB 연결 실패: {e}")
         st.stop()
 
-    tab_search, tab_orders, tab_weather, tab_cafe24 = st.tabs(
-        ["🔎 검색어 수집", "📦 주문 수집", "🌤️ 날씨", "🛒 카페24"]
-    )
-    with tab_search:
-        render_search()
-    with tab_orders:
-        render_orders()
-    with tab_weather:
-        render_weather()
-    with tab_cafe24:
-        render_cafe24()
+    user = st.session_state.get("user")
+    if not user:
+        render_login()
+        st.stop()
 
+    if user.get("kind") == "local" and user.get("must_change_pw"):
+        render_change_pw()
+        st.stop()
 
-if not check_password():
-    st.stop()
+    with st.sidebar:
+        st.title("🔎 더에르고 검색기")
+        st.caption(f"👤 {user.get('name')}" + (" (관리자)" if user.get("is_admin") else ""))
+        if st.button("로그아웃"):
+            st.session_state.pop("user", None)
+            st.rerun()
+
+    # 권한 있는 화면만 메뉴에 등록 → 없는 화면은 보이지도, 주소로도 접근 불가
+    allowed = SCREEN_KEYS if user.get("is_admin") else (user.get("screens") or [])
+    pages = [
+        st.Page(fn, title=title, url_path=key)
+        for key, title, fn in SCREENS
+        if key in allowed
+    ]
+    if user.get("is_admin"):
+        pages.append(st.Page(render_admin, title="🛠️ 관리자", url_path="admin"))
+
+    if not pages:
+        st.title("🔎 더에르고 검색기")
+        st.info("접근 가능한 화면이 없습니다. 관리자에게 권한을 요청하세요.")
+        st.stop()
+
+    st.navigation(pages).run()
+
 
 main()

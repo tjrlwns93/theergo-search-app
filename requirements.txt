@@ -1,3 +1,5 @@
 streamlit
 openpyxl
 psycopg2-binary
+streamlit-oauth
+python-dotenv
