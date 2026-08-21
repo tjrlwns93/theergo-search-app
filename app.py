@@ -927,10 +927,22 @@ def mobile_css():
         /* 팝오버/다이얼로그/서랍(사이드바): 고정너비 금지, 화면에 맞게 */
         [data-baseweb="popover"] > div, div[role="dialog"], [data-testid="stDialog"] > div { max-width: 96vw !important; }
         section[data-testid="stSidebar"] { max-width: 85vw !important; }
-        @media (max-width: 480px){
-          .block-container { padding-left: .8rem !important; padding-right: .8rem !important; padding-top: 2.6rem !important; }
-          [data-testid="stMetricValue"] { font-size: 1.5rem !important; }
-          section[data-testid="stSidebar"] { width: 82vw !important; }
+        /* 폰: 전반적으로 더 콤팩트하게 (요소가 너무 커 보이지 않게) */
+        @media (max-width: 640px){
+          html { font-size: 15px; }                     /* rem 기반 전체 약간 축소 */
+          h1, [data-testid="stHeading"] h1 { font-size: 1.4rem !important; line-height: 1.25 !important; }
+          h2 { font-size: 1.15rem !important; }
+          h3 { font-size: 1.02rem !important; }
+          .block-container { padding-top: 1.6rem !important; padding-left: .7rem !important; padding-right: .7rem !important; }
+          [data-testid="stVerticalBlock"] { gap: .5rem !important; }         /* 위젯 세로 간격 축소 */
+          .stButton>button, .stDownloadButton>button, [data-testid="stFormSubmitButton"] button,
+          [data-testid="stLinkButton"] a { min-height: 40px !important; padding: .3rem .8rem !important; font-size: 15px !important; }
+          [data-testid="stMetricValue"] { font-size: 1.3rem !important; }
+          [data-testid="stMetricLabel"] { font-size: .8rem !important; }
+          .stMarkdown, .stCaption, p, label, li { font-size: .92rem; }       /* 본문 살짝 작게 */
+          section[data-testid="stSidebar"] { width: 80vw !important; }
+          /* 입력칸은 16px 유지 (iOS 자동확대 방지) — 위 축소와 무관하게 고정 */
+          input, textarea, [data-baseweb="input"] input, [data-baseweb="textarea"] textarea { font-size: 16px !important; }
         }
         </style>
         """,
