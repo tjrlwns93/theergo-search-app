@@ -1,0 +1,6 @@
+# 정적 파일 서빙 켜기 (static/ 폴더 → /app/static/... 로 제공: manifest, 아이콘, 서비스워커)
+[server]
+enableStaticServing = true
+
+[theme]
+primaryColor = "#2F6FED"

@@ -19,6 +19,7 @@ import urllib.request
 import openpyxl
 import psycopg2
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ──────────────────────────────────────────────────────────────
 # 설정 (secrets 에서 읽음 — 코드에 비밀정보를 두지 않는다)
@@ -884,9 +885,153 @@ def render_cafe24():
             st.error(f"갱신 실패: {e}")
 
 
-def main():
-    st.title("🔎 더에르고 검색기")
+# ──────────────────────────────────────────────────────────────
+# 5) 모바일 공통 규칙 (한 곳에서 전체 화면에 적용)
+# ──────────────────────────────────────────────────────────────
+def mobile_css():
+    st.markdown(
+        """
+        <style>
+        /* 페이지가 좌우로 밀리지 않게 */
+        html, body, [data-testid="stAppViewContainer"], .stApp { overflow-x: hidden !important; max-width: 100%; }
+        /* 표: 넓으면 표 "안에서만" 가로 스크롤 (페이지는 안 밀림) */
+        [data-testid="stDataFrame"], [data-testid="stDataFrameResizable"] { max-width: 100% !important; }
+        [data-testid="stTable"], .stMarkdown table { display:block; overflow-x:auto; max-width:100%; }
+        /* 입력칸 글자 16px 이상 (iOS 자동 확대 방지) */
+        input, textarea, select,
+        [data-baseweb="input"] input, [data-baseweb="textarea"] textarea, [data-baseweb="base-input"] input { font-size: 16px !important; }
+        /* 버튼: 손가락으로 눌릴 만큼 크게 */
+        .stButton>button, .stDownloadButton>button, [data-testid="stFormSubmitButton"] button,
+        [data-testid="stLinkButton"] a { min-height: 44px !important; font-size: 16px !important; }
+        /* 긴 숫자·금액이 줄바꿈되어 깨지지 않게 */
+        [data-testid="stMetricValue"] { white-space: nowrap !important; }
+        /* 팝오버/다이얼로그/서랍(사이드바): 고정너비 금지, 화면에 맞게 */
+        [data-baseweb="popover"] > div, div[role="dialog"], [data-testid="stDialog"] > div { max-width: 96vw !important; }
+        section[data-testid="stSidebar"] { max-width: 85vw !important; }
+        @media (max-width: 480px){
+          .block-container { padding-left: .8rem !important; padding-right: .8rem !important; padding-top: 2.6rem !important; }
+          [data-testid="stMetricValue"] { font-size: 1.5rem !important; }
+          section[data-testid="stSidebar"] { width: 82vw !important; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
+
+def pwa_component():
+    """PWA: manifest/아이콘 head 주입 + 옛 캐시 제거 + '설치' 버튼(안드로이드 즉시설치 / iOS 안내)."""
+    components.html(
+        """
+<style>
+  * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  #bar { text-align: right; }
+  #installBtn {
+    display:none; border:0; background:#2F6FED; color:#fff; font-size:15px; font-weight:600;
+    padding:10px 16px; border-radius:10px; min-height:44px; cursor:pointer;
+    box-shadow:0 2px 8px rgba(47,111,237,.35);
+  }
+  #ios { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55);
+         align-items:center; justify-content:center; padding:20px; z-index:99999; }
+  #ios .card { background:#fff; border-radius:16px; max-width:320px; width:100%; padding:20px; text-align:center; }
+  #ios .step { text-align:left; font-size:15px; margin:10px 0; color:#333; }
+  #ios .sq { display:inline-block; width:22px; height:22px; border:2px solid #2F6FED; border-radius:5px; position:relative; vertical-align:middle; }
+  #ios .sq:after { content:"↑"; position:absolute; top:-9px; left:4px; color:#2F6FED; font-weight:700; }
+  #ios .close { margin-top:12px; color:#2F6FED; font-weight:700; cursor:pointer; }
+</style>
+<div id="bar"><button id="installBtn">📲 홈 화면에 설치</button></div>
+<div id="ios"><div class="card">
+  <div style="font-weight:700;font-size:16px;margin-bottom:6px;">홈 화면에 설치</div>
+  <div class="step">① 아래 <b>공유</b> 버튼 <span class="sq"></span> 을 누르세요</div>
+  <div class="step">② 목록에서 <b>‘홈 화면에 추가’</b> 를 누르세요</div>
+  <div class="close">닫기</div>
+</div></div>
+<script>
+(function(){
+  var P = window.parent;
+  try {
+    var doc = P.document;
+    if (!doc.getElementById('pwa-injected')) {
+      var m = doc.createElement('meta'); m.id='pwa-injected'; doc.head.appendChild(m);
+      function add(tag, attrs){ var el=doc.createElement(tag); for(var k in attrs) el.setAttribute(k, attrs[k]); doc.head.appendChild(el); }
+      add('link', {rel:'manifest', href:'/app/static/manifest.json'});
+      add('link', {rel:'apple-touch-icon', href:'/app/static/icon-192.png'});
+      add('meta', {name:'apple-mobile-web-app-capable', content:'yes'});
+      add('meta', {name:'mobile-web-app-capable', content:'yes'});
+      add('meta', {name:'apple-mobile-web-app-title', content:'Searching'});
+      add('meta', {name:'apple-mobile-web-app-status-bar-style', content:'default'});
+      add('meta', {name:'theme-color', content:'#2F6FED'});
+    }
+    // 옛날 화면 방지: 이전 서비스워커/캐시 제거
+    if (P.navigator.serviceWorker) P.navigator.serviceWorker.getRegistrations().then(function(rs){rs.forEach(function(r){r.unregister();});});
+    if (P.caches) P.caches.keys().then(function(ks){ks.forEach(function(k){P.caches.delete(k);});});
+  } catch(e){}
+
+  var isStandalone = false;
+  try { isStandalone = P.matchMedia('(display-mode: standalone)').matches || P.navigator.standalone === true; } catch(e){}
+  var ua = ''; try { ua = P.navigator.userAgent || ''; } catch(e){ ua = navigator.userAgent; }
+  var isiOS = /iphone|ipad|ipod/i.test(ua);
+
+  var btn = document.getElementById('installBtn');
+  var ios = document.getElementById('ios');
+
+  // 안드로이드/크롬: 설치 프롬프트 캡처 (부모 window)
+  try {
+    if (!P.__deferredPrompt) {
+      P.addEventListener('beforeinstallprompt', function(e){ e.preventDefault(); P.__deferredPrompt = e; if(!isStandalone) btn.style.display='inline-block'; });
+      P.addEventListener('appinstalled', function(){ btn.style.display='none'; P.__deferredPrompt=null; });
+    }
+  } catch(e){}
+
+  // 이미 설치됨 → 버튼 숨김. 아니면 표시(설치용 or 안내용)
+  if (isStandalone) { btn.style.display='none'; }
+  else { btn.style.display='inline-block'; }
+
+  btn.addEventListener('click', async function(){
+    if (P.__deferredPrompt) {
+      P.__deferredPrompt.prompt();
+      try { var r = await P.__deferredPrompt.userChoice; if(r && r.outcome==='accepted') btn.style.display='none'; } catch(e){}
+      P.__deferredPrompt = null; return;
+    }
+    // iOS 또는 프롬프트 미지원 → 안내
+    ios.style.display='flex';
+  });
+  ios.addEventListener('click', function(){ ios.style.display='none'; });
+
+  // 사이드바(햄버거 메뉴) 항목을 고르면 자동으로 닫히게 (모바일)
+  try {
+    var pdoc = P.document;
+    pdoc.addEventListener('click', function(ev){
+      var side = pdoc.querySelector('section[data-testid="stSidebar"]');
+      if (!side || !side.contains(ev.target)) return;
+      if (P.innerWidth > 768) return;               // 모바일에서만
+      var lbl = ev.target.closest('label');
+      if (!lbl) return;
+      setTimeout(function(){
+        var c = pdoc.querySelector('[data-testid="stSidebarCollapseButton"] button, [data-testid="stSidebarCollapseButton"], button[aria-label="Close sidebar"]');
+        if (c) c.click();
+      }, 150);
+    }, true);
+  } catch(e){}
+})();
+</script>
+        """,
+        height=58,
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# 6) 메인 (왼쪽 사이드바 메뉴 = 폰에서 햄버거). 화면은 한 번에 하나만 렌더.
+# ──────────────────────────────────────────────────────────────
+SCREENS_NAV = [
+    ("🔎 검색어 수집", render_search),
+    ("📦 주문 수집", render_orders),
+    ("🌤️ 날씨", render_weather),
+    ("🛒 카페24", render_cafe24),
+]
+
+
+def main():
     # DB 준비 (검색결과·주문·날씨·카페24토큰 테이블 생성)
     try:
         init_db()
@@ -894,20 +1039,17 @@ def main():
         st.error(f"DB 연결 실패: {e}")
         st.stop()
 
-    tab_search, tab_orders, tab_weather, tab_cafe24 = st.tabs(
-        ["🔎 검색어 수집", "📦 주문 수집", "🌤️ 날씨", "🛒 카페24"]
-    )
-    with tab_search:
-        render_search()
-    with tab_orders:
-        render_orders()
-    with tab_weather:
-        render_weather()
-    with tab_cafe24:
-        render_cafe24()
+    st.sidebar.markdown("### 🔎 검색기")
+    labels = [s[0] for s in SCREENS_NAV]
+    choice = st.sidebar.radio("메뉴", labels, label_visibility="collapsed")
+
+    st.title(choice)
+    dict(SCREENS_NAV)[choice]()
 
 
+# ── 앱 시작 ────────────────────────────────────────────────────
+mobile_css()
+pwa_component()
 if not check_password():
     st.stop()
-
 main()
