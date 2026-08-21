@@ -157,6 +157,25 @@ def init_db():
             );
             """
         )
+        # 수정요청함
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS change_requests (
+                id         BIGSERIAL PRIMARY KEY,
+                title      TEXT NOT NULL,
+                problem    TEXT,
+                wish       TEXT,
+                example    TEXT,
+                urgency    TEXT NOT NULL DEFAULT '보통',
+                screen     TEXT,
+                status     TEXT NOT NULL DEFAULT '대기',
+                fix_note   TEXT,
+                notified   BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
         conn.commit()
 
 
@@ -1021,6 +1040,162 @@ def pwa_component():
 
 
 # ──────────────────────────────────────────────────────────────
+# 5-1) 수정요청함 (누구나 요청 / 목록은 관리자만)
+# ──────────────────────────────────────────────────────────────
+URGENCIES = ["긴급", "높음", "보통", "낮음"]
+STATUSES = ["대기", "진행중", "완료", "보류", "거절"]
+
+
+def _dictrows(cur):
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def _send_notification(target, message):
+    # TODO: 9일차에 만든 알림(카톡/메일/노션 등)을 여기에 연결.
+    #  - target: "admin"(긴급·높음 새 요청) | "requester"(완료 통보)
+    #  - 아직 방식 미정 → 앱 흐름을 막지 않도록 조용히 무시.
+    return
+
+
+def notify_admin_new_request(req):
+    if req.get("urgency") in ("긴급", "높음"):
+        _send_notification(
+            "admin",
+            f"[{req['urgency']}] 새 수정요청 #{req['id']}: {req['title']} ({req.get('screen') or '-'})",
+        )
+
+
+def notify_requester_completed(req):
+    _send_notification(
+        "requester",
+        f"수정요청 #{req['id']} 완료. 처리내용: {req.get('fix_note') or ''}",
+    )
+
+
+def cr_submit(title, problem, wish, example, urgency, screen):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO change_requests (title, problem, wish, example, urgency, screen) "
+            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+            (title, problem, wish, example, urgency, screen),
+        )
+        rid = cur.fetchone()[0]
+        conn.commit()
+    notify_admin_new_request(
+        {"id": rid, "title": title, "urgency": urgency, "screen": screen}
+    )
+    return rid
+
+
+def cr_list():
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, title, problem, wish, example, urgency, screen, status, fix_note, created_at
+            FROM change_requests
+            ORDER BY
+              CASE status WHEN '대기' THEN 0 WHEN '진행중' THEN 1 WHEN '보류' THEN 2
+                          WHEN '완료' THEN 3 WHEN '거절' THEN 4 ELSE 5 END,
+              CASE urgency WHEN '긴급' THEN 0 WHEN '높음' THEN 1 WHEN '보통' THEN 2 ELSE 3 END,
+              created_at DESC
+            """
+        )
+        return _dictrows(cur)
+
+
+def cr_update(req_id, status, fix_note):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE change_requests SET status=%s, fix_note=%s, updated_at=now() WHERE id=%s",
+            (status, fix_note, req_id),
+        )
+        conn.commit()
+    if status == "완료":
+        notify_requester_completed({"id": req_id, "status": status, "fix_note": fix_note})
+
+
+@st.dialog("🛠 수정 요청")
+def cr_dialog():
+    screen = st.session_state.get("current_screen", "-")
+    st.caption(f"현재 화면: **{screen}** — 자동으로 함께 저장됩니다")
+    title = st.text_input("제목")
+    problem = st.text_area("뭐가 문제인가요?")
+    wish = st.text_area("어떻게 됐으면 좋겠나요?")
+    example = st.text_area("예시 (있으면)")
+    urgency = st.selectbox("급한 정도", URGENCIES, index=2)
+    if st.button("보내기", type="primary", use_container_width=True):
+        if not title.strip():
+            st.error("제목을 입력하세요.")
+        else:
+            try:
+                cr_submit(title.strip(), problem, wish, example, urgency, screen)
+                st.success("요청이 접수되었습니다. 감사합니다!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"저장 실패: {e}")
+
+
+def cr_admin_ui():
+    """사이드바 관리자 잠금해제 (계정 시스템이 없어 admin_password 로 대체)."""
+    with st.sidebar.expander("🔑 관리자"):
+        if st.session_state.get("cr_admin"):
+            st.caption("관리자 모드 ✓")
+            if st.button("잠그기"):
+                st.session_state["cr_admin"] = False
+                st.rerun()
+        else:
+            pw = st.text_input("관리자 비밀번호", type="password", key="cr_admin_pw")
+            if st.button("관리자 로그인"):
+                real = get_secret("admin_password")
+                if real and pw == real:
+                    st.session_state["cr_admin"] = True
+                    st.rerun()
+                else:
+                    st.error("비밀번호가 틀렸습니다.")
+
+
+def render_requests():
+    st.caption("접수된 수정요청 (대기 → 진행중 → 보류 → 완료 → 거절 순, 급한 것 위로)")
+    reqs = cr_list()
+    pending = sum(1 for r in reqs if r["status"] == "대기")
+    st.write(f"총 **{len(reqs)}**건 · 대기 **{pending}**건")
+    if not reqs:
+        st.info("아직 요청이 없습니다.")
+        return
+    for r in reqs:
+        with st.container(border=True):
+            st.markdown(f"**[{r['urgency']}] {r['title']}**  ·  `{r['status']}`")
+            st.caption(
+                f"🖥 {r['screen'] or '-'} · 🕒 {r['created_at'].strftime('%Y-%m-%d %H:%M')} · #{r['id']}"
+            )
+            if r["problem"]:
+                st.markdown(f"- **문제:** {r['problem']}")
+            if r["wish"]:
+                st.markdown(f"- **바람:** {r['wish']}")
+            if r["example"]:
+                st.markdown(f"- **예시:** {r['example']}")
+            new_status = st.selectbox(
+                "상태",
+                STATUSES,
+                index=STATUSES.index(r["status"]) if r["status"] in STATUSES else 0,
+                key=f"cr_st_{r['id']}",
+            )
+            fix = st.text_area(
+                "무엇을 어떻게 고쳤나 (완료 시 필수)",
+                value=r["fix_note"] or "",
+                key=f"cr_fx_{r['id']}",
+            )
+            if st.button("저장", key=f"cr_sv_{r['id']}"):
+                if new_status == "완료" and not fix.strip():
+                    st.warning("완료로 바꿀 땐 처리 내용을 적어주세요.")
+                else:
+                    cr_update(r["id"], new_status, fix.strip() or None)
+                    st.success("저장됨")
+                    st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────
 # 6) 메인 (왼쪽 사이드바 메뉴 = 폰에서 햄버거). 화면은 한 번에 하나만 렌더.
 # ──────────────────────────────────────────────────────────────
 SCREENS_NAV = [
@@ -1040,11 +1215,24 @@ def main():
         st.stop()
 
     st.sidebar.markdown("### 🔎 검색기")
+    cr_admin_ui()  # 관리자 잠금해제(사이드바)
+
     labels = [s[0] for s in SCREENS_NAV]
+    if st.session_state.get("cr_admin"):
+        labels = labels + ["📮 수정요청함"]
     choice = st.sidebar.radio("메뉴", labels, label_visibility="collapsed")
+    st.session_state["current_screen"] = choice
 
     st.title(choice)
-    dict(SCREENS_NAV)[choice]()
+
+    # 모든 화면 공통: '수정 요청' 버튼 (여기 한 곳에만 달아서 전 화면에 노출)
+    if st.button("🛠 수정 요청"):
+        cr_dialog()
+
+    if choice == "📮 수정요청함":
+        render_requests()
+    else:
+        dict(SCREENS_NAV)[choice]()
 
 
 # ── 앱 시작 ────────────────────────────────────────────────────
